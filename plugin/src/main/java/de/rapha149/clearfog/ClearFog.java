@@ -22,9 +22,16 @@ import java.util.Map;
 public final class ClearFog extends JavaPlugin {
 
     private static final Map<String, String> VERSIONS = Map.ofEntries(
+            Map.entry("1.20", "1_20_R1"),
+            Map.entry("1.20.1", "1_20_R1"),
+            Map.entry("1.20.2", "1_20_R2"),
+            Map.entry("1.20.3", "1_20_R3"),
+            Map.entry("1.20.4", "1_20_R3"),
             Map.entry("1.20.5", "1_20_R4"),
             Map.entry("1.20.6", "1_20_R4"),
+            Map.entry("1.21", "1_21_R1"),
             Map.entry("1.21.1", "1_21_R1"),
+            Map.entry("1.21.2", "1_21_R2"),
             Map.entry("1.21.3", "1_21_R2"),
             Map.entry("1.21.4", "1_21_R3"),
             Map.entry("1.21.5", "1_21_R4"),
