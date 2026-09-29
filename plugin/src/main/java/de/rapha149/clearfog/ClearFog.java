@@ -1,22 +1,23 @@
 package de.rapha149.clearfog;
 
-import de.rapha149.clearfog.Metrics.DrilldownPie;
-import de.rapha149.clearfog.Metrics.SimplePie;
-import de.rapha149.clearfog.Metrics.SingleLineChart;
+import de.rapha149.clearfog.cache.ViewDistanceCache;
+import de.rapha149.clearfog.cache.impl.ConcurrentViewDistanceCache;
+import de.rapha149.clearfog.command.CommandRegistry;
+import de.rapha149.clearfog.config.ConfigManager;
+import de.rapha149.clearfog.config.FogConfig;
+import de.rapha149.clearfog.listener.ListenerRegistry;
+import de.rapha149.clearfog.messaging.PlayerMessenger;
+import de.rapha149.clearfog.messaging.impl.AdventurePlayerMessenger;
+import de.rapha149.clearfog.network.NetworkInjector;
+import de.rapha149.clearfog.network.impl.NettyNetworkInjector;
+import de.rapha149.clearfog.scheduler.TaskScheduler;
+import de.rapha149.clearfog.service.FogService;
+import de.rapha149.clearfog.service.impl.DefaultFogService;
 import de.rapha149.clearfog.version.VersionWrapper;
 import org.bukkit.Bukkit;
 import org.bukkit.plugin.java.JavaPlugin;
 
-import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.util.HashMap;
 import java.util.Map;
-
-import static de.rapha149.clearfog.Messages.getMessage;
-import static de.rapha149.clearfog.Messages.loadMessages;
-import static de.rapha149.clearfog.Util.WRAPPER;
-import static de.rapha149.clearfog.Util.config;
 
 public final class ClearFog extends JavaPlugin {
 
@@ -39,116 +40,88 @@ public final class ClearFog extends JavaPlugin {
     );
     private static final String NEWEST_VERSION = "26_R2";
 
-    private static ClearFog instance;
+    private TaskScheduler taskScheduler;
+    private ConfigManager configManager;
+    private ViewDistanceCache viewDistanceCache;
+    private FogService fogService;
+    private NetworkInjector networkInjector;
+    private ListenerRegistry listenerRegistry;
+    private CommandRegistry commandRegistry;
+    private PlayerMessenger playerMessenger;
 
     @Override
     public void onEnable() {
-        instance = this;
-
+        // 1. Version Detection & Wrapper Instantiation
         String craftBukkitPackage = Bukkit.getServer().getClass().getPackage().getName();
         String nmsVersion;
-        if (craftBukkitPackage.contains(".v"))
+        if (craftBukkitPackage.contains(".v")) {
             nmsVersion = craftBukkitPackage.split("\\.")[3].substring(1);
-        else {
-            // since 26.1 paper and its forks report the api version as "26.1.2.build.69-stable"
+        } else {
             String bukkitVersion = Bukkit.getBukkitVersion().split("-")[0];
             int buildIndex = bukkitVersion.indexOf(".build.");
-            if (buildIndex != -1)
+            if (buildIndex != -1) {
                 bukkitVersion = bukkitVersion.substring(0, buildIndex);
+            }
             nmsVersion = VERSIONS.getOrDefault(bukkitVersion, NEWEST_VERSION);
         }
         getLogger().info("Server version \"" + Bukkit.getBukkitVersion() + "\" detected, using version support \"" + nmsVersion + "\".");
 
+        VersionWrapper wrapper;
         try {
-            WRAPPER = (VersionWrapper) Class.forName(VersionWrapper.class.getPackage().getName() + ".Wrapper" + nmsVersion).newInstance();
-        } catch (IllegalAccessException | InstantiationException e) {
-            throw new IllegalStateException("Failed to load support for server version \"" + nmsVersion + "\"", e);
-        } catch (ClassNotFoundException e) {
-            throw new IllegalStateException("ClearFog does not support the server version \"" + nmsVersion + "\"", e);
+            Class<?> wrapperClass = Class.forName(VersionWrapper.class.getPackage().getName() + ".Wrapper" + nmsVersion);
+            wrapper = (VersionWrapper) wrapperClass.getDeclaredConstructor().newInstance();
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("Failed to load ClearFog support for server version \"" + nmsVersion + "\"", e);
         }
 
-        loadMessages();
-        loadConfig();
+        // 2. Scheduler & Configuration
+        this.taskScheduler = new TaskScheduler(this);
+        this.configManager = new ConfigManager(this, this.taskScheduler);
+        FogConfig config = this.configManager.load();
 
-        boolean ploudos;
+        // 3. Lock-free Cache & Services
+        this.viewDistanceCache = new ConcurrentViewDistanceCache();
+        this.fogService = new DefaultFogService(this.viewDistanceCache, wrapper, config);
+        this.playerMessenger = new AdventurePlayerMessenger();
+
+        // 4. Netty Pipeline Injection
+        this.networkInjector = new NettyNetworkInjector(this.viewDistanceCache, this.fogService, wrapper);
         try {
-            ploudos = Files.readString(Path.of("eula.txt")).contains("PloudOS");
-        } catch (IOException e) {
-            e.printStackTrace();
-            ploudos = false;
-        }
-        boolean finalPloudos = ploudos;
-
-        Metrics metrics = new Metrics(this, 13628);
-        metrics.addCustomChart(new SingleLineChart("ploudos_servers", () -> finalPloudos ? 1 : 0));
-        metrics.addCustomChart(new SingleLineChart("default_view_distance_enabled", () -> config.getBoolean("default.enabled") ? 1 : 0));
-        metrics.addCustomChart(new SingleLineChart("player_specific_view_distance_enabled", () -> config.getBoolean("individual.enabled") ? 1 : 0));
-        metrics.addCustomChart(new SingleLineChart("world_specific_view_distance_enabled", () -> config.getBoolean("world.enabled") ? 1 : 0));
-        metrics.addCustomChart(new SimplePie("default_view_distance", () -> String.valueOf(config.getInt("default.view-distance"))));
-        metrics.addCustomChart(new SimplePie("direct_updates_enabled", () -> String.valueOf(config.getBoolean("direct-view-distance-updates"))));
-        metrics.addCustomChart(new DrilldownPie("check_for_updates", () -> {
-            Map<String, Map<String, Integer>> map = new HashMap<>();
-            Map<String, Integer> entry = new HashMap<>();
-            entry.put(getDescription().getVersion(), 1);
-            map.put(String.valueOf(config.getBoolean("check-for-updates")), entry);
-            return map;
-        }));
-
-        if (config.getBoolean("check-for-updates")) {
-            Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
-                String version = Updates.getAvailableVersion(true);
-                if (version == null)
-                    getLogger().info(getMessage("plugin.up_to_date"));
-                else {
-                    for (String line : getMessage("plugin.outdated").replace("%version%", version)
-                            .replace("%url%", Updates.SPIGOT_URL).split("\n")) {
-                        getLogger().warning(line);
-                    }
-                }
-            });
-        }
-
-        try {
-            Util.registerHandler();
-        } catch (NoSuchFieldException | IllegalAccessException e) {
-            e.printStackTrace();
+            this.networkInjector.registerServerPipelines();
+        } catch (Exception e) {
+            getLogger().severe("Failed to inject ClearFog into Netty server pipelines!");
             getServer().getPluginManager().disablePlugin(this);
             return;
         }
 
-        new FogCommand(getCommand("fog"));
-        getServer().getPluginManager().registerEvents(new Events(), this);
-        getLogger().info(getMessage("plugin.enable"));
-    }
+        // 5. Presentation, Listeners & Commands
+        this.listenerRegistry = new ListenerRegistry(this, this.fogService, this.viewDistanceCache, this.taskScheduler);
+        this.listenerRegistry.registerAll();
 
-    public static ClearFog getInstance() {
-        return instance;
+        this.commandRegistry = new CommandRegistry(this, this.fogService, this.configManager, this.playerMessenger);
+        this.commandRegistry.registerAll();
+
+        getLogger().info("ClearFog successfully enabled.");
     }
 
     @Override
     public void onDisable() {
-        try {
-            Util.unregisterHandler();
-        } catch (NoSuchFieldException | IllegalAccessException e) {
-            e.printStackTrace();
+        if (this.listenerRegistry != null) {
+            this.listenerRegistry.unregisterAll();
         }
-        getLogger().info(getMessage("plugin.disable"));
-    }
 
-    void loadConfig() {
-        config = getConfig();
-        config.addDefault("check-for-updates", true);
-        config.addDefault("direct-view-distance-updates", false);
-        config.addDefault("default.enabled", true);
-        config.addDefault("default.view-distance", 32);
-        config.addDefault("world.enabled", false);
-        if (!config.isConfigurationSection("world.worlds"))
-            config.createSection("world.worlds");
-        config.addDefault("individual.enabled", false);
-        if (!config.isConfigurationSection("individual.players"))
-            config.createSection("individual.players");
-        config.options().copyDefaults(true);
-        saveConfig();
-        Util.checkViewDistances();
+        if (this.networkInjector != null) {
+            try {
+                this.networkInjector.unregisterServerPipelines();
+            } catch (Exception e) {
+                getLogger().warning("Failed to cleanly unregister Netty server pipelines on shutdown.");
+            }
+        }
+
+        if (this.viewDistanceCache != null) {
+            this.viewDistanceCache.clear();
+        }
+
+        getLogger().info("ClearFog disabled.");
     }
 }

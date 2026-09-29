@@ -1,0 +1,113 @@
+name: ClearFog CI & Release Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: 'Manually trigger a release build'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build & Package Plugin
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Resolve Dynamic Versioning
+        id: versioning
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            RAW_TAG="${GITHUB_REF_NAME}"
+            VERSION="${RAW_TAG#v}"
+            IS_RELEASE="true"
+            ARTIFACT_NAME="ClearFog-${VERSION}.jar"
+          else
+            SHORT_SHA=$(git rev-parse --short HEAD)
+            VERSION="1.6.9-SNAPSHOT-${SHORT_SHA}"
+            IS_RELEASE="false"
+            ARTIFACT_NAME="ClearFog-dev-${SHORT_SHA}.jar"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "is_release=${IS_RELEASE}" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=${ARTIFACT_NAME}" >> "$GITHUB_OUTPUT"
+          echo "Built version: ${VERSION} (Release: ${IS_RELEASE})"
+
+      - name: Compile and Package with Maven
+        run: |
+          mvn clean package --batch-mode --no-transfer-progress -DskipTests
+
+      - name: Prepare Staged Artifacts
+        id: stage
+        shell: bash
+        run: |
+          mkdir -p dist
+          # Identify shaded jar, ignoring original unshaded jars
+          JAR_FILE=$(find plugin/target -maxdepth 1 -name "ClearFog-*.jar" ! -name "original-*.jar" | head -n 1)
+          if [ -z "$JAR_FILE" ]; then
+            echo "Error: Could not locate built ClearFog JAR file in plugin/target!"
+            exit 1
+          fi
+          TARGET_JAR="dist/${{ steps.versioning.outputs.artifact_name }}"
+          cp "$JAR_FILE" "$TARGET_JAR"
+          
+          # Generate SHA-256 Checksum
+          cd dist
+          sha256sum "${{ steps.versioning.outputs.artifact_name }}" > "${{ steps.versioning.outputs.artifact_name }}.sha256"
+          cd ..
+
+          echo "jar_path=${TARGET_JAR}" >> "$GITHUB_OUTPUT"
+          echo "checksum_path=${TARGET_JAR}.sha256" >> "$GITHUB_OUTPUT"
+          ls -la dist/
+
+      - name: Upload Downloadable Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.versioning.outputs.artifact_name }}
+          path: |
+            dist/*
+          retention-days: 30
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.create_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "ClearFog v${{ steps.versioning.outputs.version }}"
+          tag_name: ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            dist/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
